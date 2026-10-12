@@ -565,6 +565,17 @@ test('recovery charges an expired reservation after the reserving process is ter
     },
     stdio: ['ignore', 'ignore', 'pipe', 'ipc'],
   });
+  const app = createApp({
+    dbPath,
+    ...configuration,
+    usageGracePeriodSeconds: 0,
+    planConfig: {
+      starter: { monthlyIncludedOperations: 1 },
+      pro: { monthlyIncludedOperations: 10 },
+      growth: { monthlyIncludedOperations: 15 },
+    },
+  });
+  let server;
   let stderr = '';
   worker.stderr.setEncoding('utf8');
   worker.stderr.on('data', (chunk) => { stderr += chunk; });
@@ -629,12 +640,176 @@ test('recovery charges an expired reservation after the reserving process is ter
     assert.equal(history[0].operations, 1);
     assert.equal(history[0].period, '2026-10');
     assert.equal(history[0].resource, 'reservation_recovery');
+
+    await app.locals.initialize();
+    server = app.listen(0);
+    await new Promise((resolve) => server.once('listening', resolve));
+    const baseUrl = `http://127.0.0.1:${server.address().port}`;
+    const loginResponse = await fetch(`${baseUrl}/api/v1/auth/login`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        username: configuration.adminUsername,
+        password: configuration.adminPassword,
+      }),
+    });
+    assert.equal(loginResponse.status, 200);
+    const token = (await loginResponse.json()).token;
+    const usageResponse = await fetch(`${baseUrl}/api/v1/usage?tenantId=tenant-demo&period=2026-10`, {
+      headers: { authorization: `Bearer ${token}` },
+    });
+    assert.equal(usageResponse.status, 200);
+    const usagePayload = await usageResponse.json();
+    assert.equal(
+      usagePayload.history.filter((event) => event.resource === 'reservation_recovery').length,
+      1,
+    );
   } finally {
     if (worker.exitCode === null && worker.signalCode === null) {
       const exited = once(worker, 'exit');
       worker.kill('SIGKILL');
       await exited;
     }
+    if (server) {
+      await new Promise((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
+    }
+    await app.locals.close();
+    await repository.close();
+  }
+});
+
+test('reservation completion racing expiry recovery is accounted exactly once', async () => {
+  const dbPath = getTemporaryDbPath('usage-reservation-completion-race');
+  const configuration = {
+    adminUsername: 'race-test-admin',
+    adminPassword: 'local-race-test-admin-password',
+    seedDemoData: true,
+  };
+  const repositories = [
+    createRepository(dbPath, configuration),
+    createRepository(dbPath, configuration),
+  ];
+  const includedOperations = { starter: 1, pro: 10, growth: 15 };
+  const reservedAt = new Date('2026-10-12T17:00:00.000Z');
+  const reservation = {
+    tenantIds: ['tenant-demo'],
+    period: '2026-10',
+    operation: 'write',
+    actor: 'race-test',
+    resource: 'tenant_data',
+    operations: 1,
+    includedOperations,
+    gracePeriodSeconds: 0,
+    now: reservedAt,
+  };
+
+  try {
+    await repositories[0].initialize();
+    await repositories[1].initialize();
+    const activeReservation = await repositories[0].reserveUsage(reservation);
+    assert.ok(activeReservation);
+    const [completionResult, recoveryResult] = await Promise.all([
+      repositories[0].completeUsageReservation(
+        activeReservation,
+        true,
+        new Date('2026-10-12T17:06:00.000Z'),
+      ).then(() => null),
+      repositories[1].reserveUsage({
+        ...reservation,
+        actor: 'recovery-race-request',
+        now: new Date('2026-10-12T17:06:00.000Z'),
+      }).then((value) => value, (error) => error),
+    ]);
+    assert.equal(completionResult, null);
+    assert.equal(recoveryResult.code, 'usage_limit_exceeded');
+
+    const usage = await repositories[0].getUsageSummary('tenant-demo', '2026-10', includedOperations);
+    assert.equal(usage.usedOperations, 1);
+    assert.equal(usage.remainingOperations, 0);
+    const history = await repositories[0].getUsageHistory('tenant-demo', 10);
+    assert.equal(history.length, 1);
+    assert.equal(history[0].operations, 1);
+    assert.equal(history[0].period, '2026-10');
+
+    await assert.rejects(repositories[0].reserveUsage({
+      ...reservation,
+      now: new Date('2026-10-12T17:07:00.000Z'),
+    }), { code: 'usage_limit_exceeded' });
+
+    const completedBeforeExpiry = await repositories[0].reserveUsage({
+      ...reservation,
+      period: '2026-11',
+      now: reservedAt,
+    });
+    assert.ok(completedBeforeExpiry);
+    await repositories[0].completeUsageReservation(
+      completedBeforeExpiry,
+      true,
+      new Date('2026-10-12T17:01:00.000Z'),
+    );
+    await assert.rejects(repositories[1].reserveUsage({
+      ...reservation,
+      period: '2026-11',
+      now: new Date('2026-10-12T17:06:00.000Z'),
+    }), { code: 'usage_limit_exceeded' });
+    const completedHistory = await repositories[0].getUsageHistory('tenant-demo', 10);
+    const novemberHistory = completedHistory.filter((event) => event.period === '2026-11');
+    assert.equal(novemberHistory.length, 1);
+    assert.equal(novemberHistory[0].resource, 'tenant_data');
+    assert.equal(novemberHistory[0].operations, 1);
+  } finally {
+    await Promise.all(repositories.map((repository) => repository.close()));
+  }
+});
+
+test('expired reservations are charged to their original billing period after rollover', async () => {
+  const dbPath = getTemporaryDbPath('usage-reservation-period-rollover');
+  const repository = createRepository(dbPath, {
+    adminUsername: 'rollover-test-admin',
+    adminPassword: 'local-rollover-test-admin-password',
+    seedDemoData: true,
+  });
+  const includedOperations = { starter: 1, pro: 10, growth: 15 };
+
+  try {
+    await repository.initialize();
+    const expiredReservation = await repository.reserveUsage({
+      tenantIds: ['tenant-demo'],
+      period: '2026-10',
+      operation: 'write',
+      actor: 'rollover-crash-test',
+      resource: 'tenant_data',
+      operations: 1,
+      includedOperations,
+      gracePeriodSeconds: 0,
+      now: new Date('2026-10-31T23:59:00.000Z'),
+    });
+    assert.ok(expiredReservation);
+
+    const novemberReservation = await repository.reserveUsage({
+      tenantIds: ['tenant-demo'],
+      period: '2026-11',
+      operation: 'write',
+      actor: 'november-request',
+      resource: 'tenant_data',
+      operations: 1,
+      includedOperations,
+      gracePeriodSeconds: 0,
+      now: new Date('2026-11-01T00:05:01.000Z'),
+    });
+    assert.ok(novemberReservation);
+    await repository.completeUsageReservation(novemberReservation, false);
+
+    const octoberUsage = await repository.getUsageSummary('tenant-demo', '2026-10', includedOperations);
+    const novemberUsage = await repository.getUsageSummary('tenant-demo', '2026-11', includedOperations);
+    assert.equal(octoberUsage.usedOperations, 1);
+    assert.equal(novemberUsage.usedOperations, 0);
+    const history = await repository.getUsageHistory('tenant-demo', 10);
+    assert.equal(history.length, 1);
+    assert.equal(history[0].period, '2026-10');
+    assert.equal(history[0].resource, 'reservation_recovery');
+    assert.equal(history[0].operations, 1);
+  } finally {
     await repository.close();
   }
 });
