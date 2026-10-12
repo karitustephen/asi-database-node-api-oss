@@ -1,0 +1,95 @@
+name: PostgreSQL integration
+
+on:
+  pull_request:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  postgres-integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Start isolated PostgreSQL with test TLS certificates
+        shell: bash
+        run: |
+          set -euo pipefail
+          tls_dir="${RUNNER_TEMP}/asi-postgres-tls"
+          mkdir -p "$tls_dir"
+          chmod 755 "$tls_dir"
+
+          openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
+            -keyout "$tls_dir/ca.key" -out "$tls_dir/ca.crt" \
+            -subj '/CN=ASI CI Test Root CA' >/dev/null 2>&1
+          openssl req -newkey rsa:2048 -nodes \
+            -keyout "$tls_dir/server.key" -out "$tls_dir/server.csr" \
+            -subj '/CN=localhost' >/dev/null 2>&1
+          printf 'subjectAltName=DNS:localhost\nextendedKeyUsage=serverAuth\n' > "$tls_dir/server.ext"
+          openssl x509 -req -in "$tls_dir/server.csr" \
+            -CA "$tls_dir/ca.crt" -CAkey "$tls_dir/ca.key" -CAcreateserial \
+            -out "$tls_dir/server.crt" -days 1 -extfile "$tls_dir/server.ext" >/dev/null 2>&1
+          openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
+            -keyout "$tls_dir/untrusted-ca.key" -out "$tls_dir/untrusted-ca.crt" \
+            -subj '/CN=ASI CI Untrusted Test CA' >/dev/null 2>&1
+
+          container_name="asi-postgres-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          echo "ASI_POSTGRES_CONTAINER=$container_name" >> "$GITHUB_ENV"
+          docker run -d --name "$container_name" \
+            -e POSTGRES_PASSWORD=ci-local-superuser-only \
+            -e POSTGRES_DB=asi_tenant_test \
+            -p 127.0.0.1::5432 \
+            -v "$tls_dir:/tls:ro" \
+            --entrypoint /bin/sh postgres:17-alpine \
+            -c 'cp /tls/server.crt /var/lib/postgresql/server.crt &&
+                cp /tls/server.key /var/lib/postgresql/server.key &&
+                chown 70:70 /var/lib/postgresql/server.crt /var/lib/postgresql/server.key &&
+                chmod 600 /var/lib/postgresql/server.key &&
+                exec gosu postgres /usr/local/bin/docker-entrypoint.sh postgres -c ssl=on -c ssl_cert_file=/var/lib/postgresql/server.crt -c ssl_key_file=/var/lib/postgresql/server.key'
+
+          port="$(docker port "$container_name" 5432/tcp | sed 's/.*://')"
+          for attempt in $(seq 1 60); do
+            if docker exec "$container_name" pg_isready -U postgres -d asi_tenant_test >/dev/null 2>&1; then
+              break
+            fi
+            if [ "$attempt" -eq 60 ]; then
+              docker logs "$container_name"
+              exit 1
+            fi
+            sleep 1
+          done
+
+          test_password="$(openssl rand -hex 24)"
+          docker exec "$container_name" psql -v ON_ERROR_STOP=1 -U postgres -d asi_tenant_test \
+            -c "CREATE ROLE asi_test LOGIN PASSWORD '$test_password' NOSUPERUSER NOBYPASSRLS; GRANT CREATE ON DATABASE asi_tenant_test TO asi_test;"
+
+          echo "ASI_TEST_TENANT_PG_URL=postgresql://asi_test:${test_password}@127.0.0.1:${port}/asi_tenant_test" >> "$GITHUB_ENV"
+          echo "ASI_TENANT_PG_URL=postgresql://asi_test:${test_password}@127.0.0.1:${port}/asi_tenant_test" >> "$GITHUB_ENV"
+          echo "ASI_TEST_TENANT_PG_TLS_URL=postgresql://asi_test:${test_password}@localhost:${port}/asi_tenant_test" >> "$GITHUB_ENV"
+          echo "ASI_TEST_TENANT_PG_TLS_CA=$(base64 -w0 "$tls_dir/ca.crt")" >> "$GITHUB_ENV"
+          echo "ASI_TEST_TENANT_PG_TLS_UNTRUSTED_CA=$(base64 -w0 "$tls_dir/untrusted-ca.crt")" >> "$GITHUB_ENV"
+          echo "NODE_OPTIONS=--dns-result-order=ipv4first" >> "$GITHUB_ENV"
+
+      - name: Run required PostgreSQL and TLS integration tests
+        run: npm run test:postgres:ci
+
+      - name: Remove isolated PostgreSQL
+        if: always()
+        run: |
+          if [ -n "${ASI_POSTGRES_CONTAINER:-}" ]; then
+            docker rm -f "$ASI_POSTGRES_CONTAINER" >/dev/null 2>&1 || true
+          fi

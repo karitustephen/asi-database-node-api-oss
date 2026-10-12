@@ -94,6 +94,8 @@ npm run test:postgres
 
 This test verifies successful certificate and hostname validation, and rejection of an untrusted CA and a hostname mismatch. It does not contact a managed PostgreSQL service.
 
+The `PostgreSQL integration` GitHub Actions workflow provisions an isolated PostgreSQL 17 instance with generated TLS certificates and runs `npm run test:postgres:ci`. That command fails before testing if the database URL or any TLS fixtures are missing, so the PostgreSQL and TLS tests cannot silently skip in this CI job.
+
 Run tests:
 
 ```bash
