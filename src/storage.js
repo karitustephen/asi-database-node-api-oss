@@ -399,6 +399,21 @@ function createRepository(dbPath, configuration = {}) {
     return allSql(db, `SELECT * FROM databases WHERE tenant_id IN (${placeholders}) ORDER BY created_at DESC`, tenantIds);
   }
 
+  async function getProjectById(projectId) {
+    const row = await getSql(db, 'SELECT * FROM projects WHERE id = ?', [projectId]);
+    return row ? { ...row, tenantId: row.tenant_id, createdAt: row.created_at } : null;
+  }
+
+  async function getDatabaseById(databaseId) {
+    const row = await getSql(db, 'SELECT * FROM databases WHERE id = ?', [databaseId]);
+    return row ? {
+      ...row,
+      tenantId: row.tenant_id,
+      projectId: row.project_id || null,
+      createdAt: row.created_at,
+    } : null;
+  }
+
   async function canAccessTenant(user, tenantId) {
     if (!tenantId) {
       return true;
@@ -650,10 +665,14 @@ function createRepository(dbPath, configuration = {}) {
     operation,
     actor,
     resource,
+    operations = 1,
     includedOperations,
     gracePeriodSeconds,
     now = new Date(),
   }) {
+    if (!Number.isSafeInteger(operations) || operations < 1 || operations > 100) {
+      throw new Error('Usage reservation operations must be between 1 and 100.');
+    }
     const reservationId = randomId('usage-reservation');
     const allocations = [];
     let limitFailure = null;
@@ -723,15 +742,15 @@ function createRepository(dbPath, configuration = {}) {
         }
         await runSql(
           db,
-          'INSERT INTO usage_reservations (id, tenant_id, period, operations, expires_at) VALUES (?, ?, ?, 1, ?)',
-          [`${reservationId}-${tenantId}`, tenantId, tenantPeriod, expiresAt],
+          'INSERT INTO usage_reservations (id, tenant_id, period, operations, expires_at) VALUES (?, ?, ?, ?, ?)',
+          [`${reservationId}-${tenantId}`, tenantId, tenantPeriod, operations, expiresAt],
         );
         await runSql(
           db,
-          'UPDATE usage_periods SET reserved_operations = reserved_operations + 1 WHERE tenant_id = ? AND period = ?',
-          [tenantId, tenantPeriod],
+          'UPDATE usage_periods SET reserved_operations = reserved_operations + ? WHERE tenant_id = ? AND period = ?',
+          [operations, tenantId, tenantPeriod],
         );
-        if (used + reserved + 1 >= quota && !usage.grace_deadline) {
+        if (used + reserved + operations >= quota && !usage.grace_deadline) {
           const deadline = new Date(now.getTime() + gracePeriodSeconds * 1000).toISOString();
           await runSql(
             db,
@@ -739,7 +758,7 @@ function createRepository(dbPath, configuration = {}) {
             [nowIso, deadline, tenantId, tenantPeriod],
           );
         }
-        allocations.push({ tenantId, period: tenantPeriod });
+        allocations.push({ tenantId, period: tenantPeriod, operations });
       }
 
       if (limitFailure) {
@@ -755,39 +774,44 @@ function createRepository(dbPath, configuration = {}) {
       : null;
   }
 
-  async function completeUsageReservation(reservation, succeeded, now = new Date()) {
+  async function completeUsageReservation(reservation, succeeded, now = new Date(), actualOperations) {
     if (!reservation) {
       return;
     }
     const occurredAt = now.toISOString();
     await inTransaction(async () => {
-      for (const { tenantId, period } of reservation.allocations) {
+      for (const { tenantId, period, operations: reservedOperations = 1 } of reservation.allocations) {
+        const operations = succeeded ? (actualOperations ?? reservedOperations) : 0;
+        if (!Number.isSafeInteger(operations) || operations < 0 || operations > reservedOperations) {
+          throw new Error('Completed usage operations exceed the reserved amount.');
+        }
         const reservationId = `${reservation.id}-${tenantId}`;
-        const exists = await getSql(db, 'SELECT id FROM usage_reservations WHERE id = ?', [reservationId]);
-        if (!exists) {
+        const reservationRow = await getSql(db, 'SELECT operations FROM usage_reservations WHERE id = ?', [reservationId]);
+        if (!reservationRow) {
           continue;
         }
         await runSql(db, 'DELETE FROM usage_reservations WHERE id = ?', [reservationId]);
         await runSql(
           db,
-          'UPDATE usage_periods SET reserved_operations = MAX(0, reserved_operations - 1) WHERE tenant_id = ? AND period = ?',
-          [tenantId, period],
+          'UPDATE usage_periods SET reserved_operations = MAX(0, reserved_operations - ?) WHERE tenant_id = ? AND period = ?',
+          [Number(reservationRow.operations), tenantId, period],
         );
         if (!succeeded) {
+          await clearUnusedGracePeriod(tenantId, period);
           continue;
         }
 
         await runSql(
           db,
-          'UPDATE usage_periods SET used_operations = used_operations + 1 WHERE tenant_id = ? AND period = ?',
-          [tenantId, period],
+          'UPDATE usage_periods SET used_operations = used_operations + ? WHERE tenant_id = ? AND period = ?',
+          [operations, tenantId, period],
         );
         await runSql(
           db,
           `INSERT INTO billable_usage_events
             (id, tenant_id, period, operation, operations, actor, resource, occurred_at)
-           VALUES (?, ?, ?, ?, 1, ?, ?, ?)`,
-          [randomId('usage-event'), tenantId, period, reservation.operation, reservation.actor, reservation.resource, occurredAt],
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+          [randomId('usage-event'), tenantId, period, reservation.operation, operations, reservation.actor, reservation.resource, occurredAt],
         );
 
         const usage = await getSql(
@@ -825,8 +849,21 @@ function createRepository(dbPath, configuration = {}) {
             [occurredAt, deadline, tenantId, period],
           );
         }
+        await clearUnusedGracePeriod(tenantId, period);
       }
     });
+  }
+
+  async function clearUnusedGracePeriod(tenantId, period) {
+    await runSql(
+      db,
+      `UPDATE usage_periods
+       SET grace_started_at = NULL, grace_deadline = NULL
+       WHERE tenant_id = ? AND period = ?
+         AND used_operations < included_operations
+         AND used_operations + reserved_operations < included_operations`,
+      [tenantId, period],
+    );
   }
 
   async function getUsageHistory(tenantId, limit = 100) {
@@ -890,10 +927,11 @@ function createRepository(dbPath, configuration = {}) {
     return project;
   }
 
-  async function createDatabase({ tenantId, name, engine = 'mysql', actor }) {
+  async function createDatabase({ tenantId, projectId = null, name, engine = 'mysql', actor }) {
     const database = {
       id: `db-${Date.now()}-${randomToken().slice(0, 6)}`,
       tenantId,
+      projectId,
       name,
       engine,
       status: 'provisioning',
@@ -902,8 +940,8 @@ function createRepository(dbPath, configuration = {}) {
     await inTransaction(async () => {
       await runSql(
         db,
-        'INSERT INTO databases (id, tenant_id, name, engine, status, created_at) VALUES (?, ?, ?, ?, ?, ?)',
-        [database.id, database.tenantId, database.name, database.engine, database.status, database.createdAt],
+        'INSERT INTO databases (id, tenant_id, project_id, name, engine, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
+        [database.id, database.tenantId, database.projectId, database.name, database.engine, database.status, database.createdAt],
       );
       await addAuditEntry({ actor, action: 'create_database', resource: database.id });
     });
@@ -975,6 +1013,8 @@ function createRepository(dbPath, configuration = {}) {
     listTenantsForUser: (...args) => serialize(() => listTenantsForUser(...args)),
     listProjectsForUser: (...args) => serialize(() => listProjectsForUser(...args)),
     listDatabasesForUser: (...args) => serialize(() => listDatabasesForUser(...args)),
+    getProjectById: (...args) => serialize(() => getProjectById(...args)),
+    getDatabaseById: (...args) => serialize(() => getDatabaseById(...args)),
     canAccessTenant: (...args) => serialize(() => canAccessTenant(...args)),
     createSession: (...args) => serialize(() => createSession(...args)),
     findValidSession: (...args) => serialize(() => findValidSession(...args)),

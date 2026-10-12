@@ -39,6 +39,31 @@ if [[ -n "${PUBLIC_APP_URL:-}" && ! "$PUBLIC_APP_URL" =~ ^https:// ]]; then
   echo "PUBLIC_APP_URL must use HTTPS for Stripe billing." >&2
   exit 2
 fi
+if [[ -n "${ASI_TENANT_PG_URL:-}" ]]; then
+  node - "$ASI_TENANT_PG_URL" "${ASI_TENANT_PG_SSL:-}" \
+    "${ASI_TENANT_PG_POOL_MAX:-}" "${ASI_TENANT_PG_CONNECT_TIMEOUT_MS:-}" \
+    "${ASI_TENANT_PG_IDLE_TIMEOUT_MS:-}" "${ASI_TENANT_PG_STATEMENT_TIMEOUT_MS:-}" <<'NODE'
+try {
+  const url = new URL(process.argv[2]);
+  if (!['postgres:', 'postgresql:'].includes(url.protocol)) throw new Error();
+  const ssl = process.argv[3].toLowerCase();
+  if (ssl && !['true', 'false'].includes(ssl)) throw new Error();
+  const hostname = url.hostname.toLowerCase().replace(/^\[|\]$/g, '');
+  if (ssl === 'false' && !['localhost', '127.0.0.1', '::1'].includes(hostname)) {
+    throw new Error();
+  }
+  const ranges = [[4, 1, 20], [5, 100, 30000], [6, 1000, 300000], [7, 100, 30000]];
+  for (const [index, minimum, maximum] of ranges) {
+    if (process.argv[index] === '') continue;
+    const value = Number(process.argv[index]);
+    if (!Number.isSafeInteger(value) || value < minimum || value > maximum) throw new Error();
+  }
+} catch {
+  console.error('Tenant PostgreSQL URL, TLS, or pool settings are invalid; remote PostgreSQL requires TLS.');
+  process.exit(2);
+}
+NODE
+fi
 
 for tool in node npm zip; do
   if ! command -v "$tool" >/dev/null 2>&1; then
@@ -131,6 +156,12 @@ for (const name of [
   'STRIPE_PRICE_STARTER',
   'STRIPE_PRICE_PRO',
   'STRIPE_PRICE_GROWTH',
+  'ASI_TENANT_PG_URL',
+  'ASI_TENANT_PG_SSL',
+  'ASI_TENANT_PG_POOL_MAX',
+  'ASI_TENANT_PG_CONNECT_TIMEOUT_MS',
+  'ASI_TENANT_PG_IDLE_TIMEOUT_MS',
+  'ASI_TENANT_PG_STATEMENT_TIMEOUT_MS',
 ]) {
   if (process.env[name]) settings[name] = process.env[name];
 }

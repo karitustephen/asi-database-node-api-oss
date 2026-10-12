@@ -49,6 +49,119 @@ paths:
       description: One operation is metered per tenant included in a successful listing request.
     post:
       summary: Create a database
+      description: Set engine to postgresql and include its owning tenantId and projectId to register a logical tenant-data scope. This does not provision a separate PostgreSQL server or database.
+  /api/v1/projects/{projectId}/databases/{databaseId}/records:
+    parameters:
+      - name: projectId
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: databaseId
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      summary: List tenant-scoped PostgreSQL records
+      description: Requires ownership of the project and PostgreSQL database. limit is 1-100; successful results are metered by records returned, with a minimum of one operation.
+      parameters:
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 100
+        - name: offset
+          in: query
+          schema:
+            type: integer
+            minimum: 0
+            maximum: 1000000
+            default: 0
+      responses:
+        '200':
+          description: Tenant-scoped records.
+        '403':
+          description: The authenticated principal cannot access the tenant.
+        '503':
+          description: PostgreSQL tenant data is unavailable or not configured.
+  /api/v1/projects/{projectId}/databases/{databaseId}/records/{recordKey}:
+    parameters:
+      - name: projectId
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: databaseId
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: recordKey
+        in: path
+        required: true
+        schema:
+          type: string
+          maxLength: 256
+    get:
+      summary: Read one tenant-scoped PostgreSQL record
+    put:
+      summary: Create or replace one tenant-scoped PostgreSQL record
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [value]
+              properties:
+                value:
+                  description: JSON object or array, serialized size no greater than 64 KiB.
+                  oneOf:
+                    - type: object
+                    - type: array
+    delete:
+      summary: Delete one tenant-scoped PostgreSQL record
+  /api/v1/projects/{projectId}/databases/{databaseId}/query:
+    parameters:
+      - name: projectId
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: databaseId
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      summary: Execute a restricted, parameterized PostgreSQL statement
+      description: Allows one SELECT with LIMIT 1-100, one-row INSERT, or UPDATE/DELETE matched by record_key = $n against tenant_data.records only. DDL, functions, joins, subqueries, system tables, and SQL comments are rejected.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [sql]
+              properties:
+                sql:
+                  type: string
+                params:
+                  type: array
+                  maxItems: 100
+                  items: {}
+      responses:
+        '200':
+          description: Statement execution result.
+        '400':
+          description: SQL validation or parameter error.
+        '403':
+          description: Tenant access denied or read-only API key attempted a write.
+        '503':
+          description: PostgreSQL tenant data is unavailable or not configured.
       description: One operation is metered for a successful tenant-scoped create request.
   /api/v1/usage:
     get:

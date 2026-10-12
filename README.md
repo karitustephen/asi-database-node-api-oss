@@ -1,6 +1,6 @@
 # ASI Database Node API
 
-An open-source multi-tenant API foundation for the Arybit Super Intelligence ecosystem. This repository is not represented as a production-ready commercial database platform. Azure deployment, HTTPS health verification, SQLite persistence, and recovery have not been verified against live Azure infrastructure.
+An open-source multi-tenant API foundation for the Arybit Super Intelligence ecosystem. This repository is not represented as a production-ready commercial database platform. Azure deployment, HTTPS health verification, external PostgreSQL operations, and remote recovery have not been verified against live production infrastructure.
 
 ## Implemented and locally verified
 
@@ -9,7 +9,8 @@ An open-source multi-tenant API foundation for the Arybit Super Intelligence eco
 - Transactional initialization, session/key writes, tenant resource writes, and associated audit records.
 - Password-hashed administrator provisioning with no built-in default credentials.
 - Session expiry, API-key revocation and ownership checks, read-only API-key enforcement, and tenant-aware resource access.
-- Atomic monthly usage reservations and metering for successful tenant project/database catalog reads and writes; monthly allowances are plan-configured and overridable.
+- PostgreSQL tenant-data access as a separate data plane, with bounded connection pooling, versioned migrations, transaction-local row-level security, record CRUD, and a restricted parameterized SQL endpoint.
+- Atomic monthly usage reservations for control-plane catalog operations and PostgreSQL tenant-data requests. Bounded bulk reads reserve their maximum result count and settle usage against records actually returned.
 - Tenant usage API and dashboard with remaining quota, period usage, threshold notifications, and recent usage history.
 - Stripe subscription checkout and billing-portal links plus signature-verified, idempotent subscription webhooks that update plan entitlements.
 - AES-256 encrypted SQLite backup and integrity-checked restore into a new isolated directory.
@@ -19,8 +20,8 @@ An open-source multi-tenant API foundation for the Arybit Super Intelligence eco
 
 - Live Azure deployment, HTTPS/DNS validation, Key Vault integration, managed-identity permissions, or Azure backup storage configuration.
 - Multi-instance or high-availability database operation. SQLite on App Service is limited to one app instance; do not scale this app horizontally.
-- Provisioning of actual MySQL, MariaDB, or PostgreSQL servers. Database records currently describe API resources; they do not create database servers.
-- A real database query endpoint. Metered project/database catalog API calls are not physical SQL operations against tenant databases; bulk weighted billing is not implemented.
+- Provisioning separate MySQL, MariaDB, or PostgreSQL servers/databases. PostgreSQL customer data currently lives in the app-managed `tenant_data.records` table of the configured shared PostgreSQL database, isolated by tenant, project, and database RLS policies.
+- Live verification against a managed PostgreSQL service, failover, and multi-instance operation. PostgreSQL is separate from the SQLite control plane but its availability and scaling depend on the operator-provided PostgreSQL deployment.
 - Email delivery for usage alerts, email configuration, paid overages, automatic plan upgrades, storage quota controls, connection limits, API-rate limits, or external audit export.
 - Live Stripe API/webhook verification or Stripe account/price configuration. Stripe test coverage uses a test-signature verifier and stubbed outbound API calls.
 - Automatic database schema rollback or a production restore-in-place workflow.
@@ -41,7 +42,46 @@ npm start
 
 A fresh database will refuse to initialize if `ADMIN_USERNAME` and `ADMIN_PASSWORD` are not configured. Use a unique, randomly generated password and a secret manager in deployed environments; do not commit credentials or put them in scripts or shell history. Existing databases retain their provisioned users; changing the bootstrap environment variables does not reset an existing password.
 
-The local database is created under `.data/`. Back it up before deleting that directory. Set `ASI_SEED_DEMO_DATA=true` only for local demonstrations; demo tenant/project/database rows and the optional `TENANT_ADMIN_USERNAME` / `TENANT_ADMIN_PASSWORD` account are not created by default. Those optional tenant-admin credentials must both be set and the password must be at least 16 characters.
+The control-plane database is created under `.data/`. Back it up before deleting that directory. Set `ASI_SEED_DEMO_DATA=true` only for local demonstrations; demo tenant/project/database rows and the optional `TENANT_ADMIN_USERNAME` / `TENANT_ADMIN_PASSWORD` account are not created by default. Those optional tenant-admin credentials must both be set and the password must be at least 16 characters.
+
+## PostgreSQL tenant data plane
+
+SQLite remains responsible for tenants, users, API keys, plan and billing metadata, usage reservations, and audit records. Tenant records are stored separately in an operator-provided PostgreSQL database. The application does not create PostgreSQL servers or databases and never falls back to SQLite for tenant data. Without PostgreSQL configuration, control-plane APIs remain usable while tenant data requests return `503 tenant_data_unavailable`.
+
+Configure an isolated PostgreSQL database and a dedicated **non-superuser, non-BYPASSRLS** application role. The role needs to create the `tenant_data` schema and migration ledger on its first connection. The application refuses to run its migrations if the connecting role can bypass row-level security. Remote PostgreSQL connections use TLS by default and verify the server certificate; do not set `ASI_TENANT_PG_SSL=false` for remote hosts.
+
+```bash
+export ASI_TENANT_PG_URL='postgresql://asi_app:<url-encoded-password>@localhost:5432/asi_tenant_data'
+# For local PostgreSQL only; remote endpoints default to certificate-verified TLS.
+export ASI_TENANT_PG_SSL=false
+export ASI_TENANT_PG_POOL_MAX=10
+export ASI_TENANT_PG_CONNECT_TIMEOUT_MS=5000
+export ASI_TENANT_PG_IDLE_TIMEOUT_MS=30000
+export ASI_TENANT_PG_STATEMENT_TIMEOUT_MS=5000
+```
+
+The PostgreSQL migration ledger is in [`src/migrations/postgres/`](./src/migrations/postgres/). Migrations run transactionally under an advisory lock. Every data transaction checks out one pool client, sets tenant/project/database context with transaction-local settings, executes the work on that same client, and commits or rolls back before releasing it. Forced row-level security applies even to the table-owning application role. Use database credentials with no superuser or `BYPASSRLS` privileges.
+
+Create PostgreSQL database metadata through `POST /api/v1/databases` with `engine: "postgresql"`, the owning `tenantId`, and its `projectId`. This registers a logical scope; it does not provision a separate PostgreSQL database. Tenant data endpoints are:
+
+- `GET /api/v1/projects/{projectId}/databases/{databaseId}/records?limit=100&offset=0`
+- `GET|PUT|DELETE /api/v1/projects/{projectId}/databases/{databaseId}/records/{recordKey}` (`PUT` body: `{"value":{...}}`)
+- `POST /api/v1/projects/{projectId}/databases/{databaseId}/query` with `{"sql":"SELECT * FROM tenant_data.records WHERE record_key = $1 LIMIT $2","params":["key",10]}`
+
+The authenticated principal must be authorized for the tenant, and the project/database association is checked against SQLite control-plane records before every operation. API keys with read-only scope cannot issue writes. RLS additionally scopes every statement to that tenant, project, and database. SQL accepts exactly one parameterized `SELECT`, one-row `INSERT`, or `UPDATE`/`DELETE` matched by `record_key = $n`, only against `tenant_data.records`. `SELECT` must have a `LIMIT` from 1 through 100. Functions, joins, subqueries, DDL, system-table references, and SQL comments are rejected; values must use positional parameters. Individual JSON values are limited to 64 KiB; total tenant storage quotas are not implemented.
+
+One successful single-record request counts as one database operation. A bounded bulk `SELECT` reserves its requested limit atomically before executing and settles the reservation using the number of records returned, with one operation minimum for an empty result. The SQL and record-list endpoints cap reads at 100 rows. One-row writes count as one operation. Failed database requests release their reservations. No live PostgreSQL service is contacted by the default test suite.
+
+Readiness reports PostgreSQL as `not_configured`, `available`, or `unavailable`. A configured PostgreSQL outage makes readiness return `503 degraded` and tenant-data routes return a clear `503`, but does not stop the SQLite control plane from serving its APIs. It never silently serves tenant data from SQLite.
+
+To run the live PostgreSQL integration test against an isolated local database:
+
+```bash
+export ASI_TEST_TENANT_PG_URL='postgresql://asi_test:<url-encoded-password>@localhost:5432/asi_tenant_test'
+npm run test:postgres
+```
+
+The test requires a dedicated non-superuser test role with schema-creation privileges; it runs migrations and creates then removes only uniquely named test records. Never point it at production data.
 
 Run tests:
 
@@ -76,7 +116,7 @@ SQLite migrations are versioned in [`src/migrations/`](./src/migrations/). The m
 
 ## Usage quotas and Stripe subscriptions
 
-One billable operation is one successful (`2xx`) request to a tenant-scoped `GET` or `POST` on `/api/v1/projects` or `/api/v1/databases`. A cross-tenant listing is charged once per tenant included in that request. Health, login/authentication, tenant administration, billing, usage, exports, and internal maintenance are not metered. The current API stores database-resource metadata only; these counters are not yet physical tenant SQL reads/writes. Bulk requests are not supported as database operations and are not weighted.
+One billable operation is one successful (`2xx`) tenant-scoped project/database catalog request or a PostgreSQL tenant-data request, subject to the bounded-bulk rule above. A cross-tenant catalog listing is charged once per tenant included in that request. Health, login/authentication, tenant administration, billing, usage, exports, and internal maintenance are not metered.
 
 The included-operation defaults below are **proposed SaaS defaults**, not previously approved commercial settings:
 
@@ -148,6 +188,8 @@ export AZURE_DEPLOYMENT_APPROVED=1
 ```
 
 The deployment script requires Node.js 24, runs tests, builds a production-only artifact, deploys a Linux App Service plan and HTTPS-only Node 24 LTS web app, configures the app settings and initial administrator, publishes the zip, and retries `/health` plus `/api/v1/ready` over HTTPS. The Bicep template uses a B1 plan, system-assigned identity, TLS 1.2+, and `/home/data/asi-database.sqlite`. The database path relies on App Service persistent `/home` storage and is suitable only for one app instance.
+
+For live PostgreSQL tenant data, export `ASI_TENANT_PG_URL` and any `ASI_TENANT_PG_*` pool/TLS settings in the protected deployment environment before invoking the deploy command. The script validates and transfers these as Web App settings but does not provision PostgreSQL, create credentials, or configure Key Vault; Web App settings alone are not a substitute for an approved production secret-management design.
 
 The deployment command may create billable resources and mutate the selected resource group. It was not run as part of this change. The template does not create a Key Vault, managed-identity role assignments, an external backup store, or production networking. The administrator password is passed to Azure CLI via a mode-restricted temporary settings file and becomes a Web App setting; configure Key Vault references separately before treating that as an acceptable production secret-management design.
 

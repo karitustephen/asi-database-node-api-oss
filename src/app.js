@@ -4,6 +4,8 @@ const crypto = require('node:crypto');
 const Stripe = require('stripe');
 const { createRepository, verifyPasswordHash, randomToken } = require('./storage');
 const { createPlanConfiguration, currentBillingPeriod } = require('./plans');
+const { createTenantDataRepository, validateRecordKey, validateRecordValue } = require('./tenant-data');
+const { validateTenantSql } = require('./tenant-sql');
 
 function errorResponse(res, status, code, message) {
   return res.status(status).json({
@@ -85,12 +87,14 @@ function createPlanConfig(options) {
   return createPlanConfiguration(overrides);
 }
 
-function requireUsage(repository, planConfig, gracePeriodSeconds, operation, resource, clock) {
+function requireUsage(repository, planConfig, gracePeriodSeconds, operation, resource, clock, options = {}) {
   return async function usageMiddleware(req, res, next) {
     try {
       const now = clock();
       let tenantIds;
-      if (req.method === 'GET') {
+      if (options.resolveTenantIds) {
+        tenantIds = await options.resolveTenantIds(req, repository);
+      } else if (req.method === 'GET') {
         const tenantId = typeof req.query.tenantId === 'string' ? req.query.tenantId : null;
         if (tenantId) {
           tenantIds = await repository.canAccessTenant(req.user, tenantId) ? [tenantId] : [];
@@ -115,9 +119,10 @@ function requireUsage(repository, planConfig, gracePeriodSeconds, operation, res
         tenantIds,
         period: currentBillingPeriod(now),
         periodsByTenantId,
-        operation,
+        operation: typeof operation === 'function' ? operation(req) : operation,
         actor: req.user.username,
         resource,
+        operations: options.resolveOperations ? options.resolveOperations(req) : 1,
         now,
         includedOperations: Object.fromEntries(
           Object.entries(planConfig).map(([name, plan]) => [name, plan.monthlyIncludedOperations]),
@@ -131,7 +136,12 @@ function requireUsage(repository, planConfig, gracePeriodSeconds, operation, res
           if (res.statusCode >= 200 && res.statusCode < 300) {
             if (!finalized) {
               finalized = true;
-              repository.completeUsageReservation(reservation, true, clock())
+              repository.completeUsageReservation(
+                reservation,
+                true,
+                clock(),
+                req.completedUsageOperations,
+              )
                 .then(() => originalJson(...args))
                 .catch(next);
             }
@@ -181,6 +191,68 @@ function requireUsage(repository, planConfig, gracePeriodSeconds, operation, res
   };
 }
 
+function requireTenantDatabaseContext(repository, tenantDataRepository) {
+  return async function tenantDatabaseContextMiddleware(req, res, next) {
+    try {
+      const { projectId, databaseId } = req.params;
+      const [project, database] = await Promise.all([
+        repository.getProjectById(projectId),
+        repository.getDatabaseById(databaseId),
+      ]);
+      if (!project || !database) {
+        return errorResponse(res, 404, 'database_not_found', 'The requested tenant database was not found.');
+      }
+      if (project.tenantId !== database.tenantId || database.projectId !== project.id) {
+        return errorResponse(res, 404, 'database_not_found', 'The requested tenant database was not found.');
+      }
+      if (!(await repository.canAccessTenant(req.user, project.tenantId))) {
+        return errorResponse(res, 403, 'forbidden', 'The requested database is not available to this account.');
+      }
+      if (database.engine !== 'postgresql') {
+        return errorResponse(res, 409, 'unsupported_database_engine', 'Tenant data operations require a PostgreSQL database.');
+      }
+      if (!tenantDataRepository.configured) {
+        return errorResponse(res, 503, 'tenant_data_unavailable', 'The PostgreSQL tenant data plane is not configured.');
+      }
+      try {
+        await tenantDataRepository.initialize();
+      } catch (error) {
+        console.error('Tenant PostgreSQL data plane is unavailable.', error);
+        return errorResponse(res, 503, 'tenant_data_unavailable', 'The PostgreSQL tenant data plane is unavailable.');
+      }
+      req.tenantDataContext = {
+        tenantId: project.tenantId,
+        projectId: project.id,
+        databaseId: database.id,
+      };
+      return next();
+    } catch (error) {
+      return next(error);
+    }
+  };
+}
+
+function validateTenantSqlRequest(req, res, next) {
+  try {
+    const { sql, params = [] } = req.body || {};
+    const validated = validateTenantSql(sql, params);
+    req.tenantSql = { sql, params, ...validated };
+    req.tenantDataOperationLimit = validated.maxOperations;
+    return next();
+  } catch (error) {
+    return next(error);
+  }
+}
+
+function requireTenantSqlScope(req, res, next) {
+  if (req.apiKey
+    && ['read', 'read-only'].includes(req.apiKey.scope)
+    && req.tenantSql.statementType !== 'select') {
+    return errorResponse(res, 403, 'forbidden', 'This API key does not permit write operations.');
+  }
+  return next();
+}
+
 function createApp(options = {}) {
   const dbPath = options.dbPath || process.env.ASI_DB_PATH || path.resolve(process.cwd(), '.data', 'asi-database.sqlite');
   const configuredSessionTtl = options.sessionTtlSeconds ?? process.env.SESSION_TTL_SECONDS ?? 86400;
@@ -205,6 +277,19 @@ function createApp(options = {}) {
     throw new Error(`Invalid plan configuration: ${error.message}`, { cause: error });
   }
   const repository = createRepository(dbPath, options);
+  let tenantDataRepository;
+  try {
+    tenantDataRepository = options.tenantDataRepository || createTenantDataRepository({
+      connectionString: options.tenantPostgresUrl,
+      poolMax: options.tenantPostgresPoolMax,
+      connectionTimeoutMillis: options.tenantPostgresConnectTimeoutMillis,
+      idleTimeoutMillis: options.tenantPostgresIdleTimeoutMillis,
+      statementTimeoutMillis: options.tenantPostgresStatementTimeoutMillis,
+      ssl: options.tenantPostgresSsl,
+    });
+  } catch (error) {
+    throw new Error(`Invalid tenant PostgreSQL configuration: ${error.message}`, { cause: error });
+  }
   const stripeSecretKey = options.stripeSecretKey ?? process.env.STRIPE_SECRET_KEY;
   const stripeWebhookSecret = options.stripeWebhookSecret ?? process.env.STRIPE_WEBHOOK_SECRET;
   const stripePriceIds = options.stripePriceIds || {
@@ -227,8 +312,23 @@ function createApp(options = {}) {
   }
   const publicAppUrl = options.publicAppUrl ?? process.env.PUBLIC_APP_URL;
   const app = express();
-  app.locals.initialize = () => repository.initialize();
-  app.locals.close = () => repository.close();
+  app.locals.initialize = async () => {
+    await repository.initialize();
+    if (tenantDataRepository.configured) {
+      try {
+        await tenantDataRepository.initialize();
+      } catch (error) {
+        console.error('Tenant PostgreSQL data plane initialization failed; control-plane APIs remain available.', error);
+      }
+    }
+  };
+  app.locals.close = async () => {
+    const results = await Promise.allSettled([repository.close(), tenantDataRepository.close()]);
+    const errors = results.filter((result) => result.status === 'rejected').map((result) => result.reason);
+    if (errors.length) {
+      throw new AggregateError(errors, 'Failed to close one or more storage connections.');
+    }
+  };
 
   app.disable('x-powered-by');
   app.post('/api/v1/billing/webhook', express.raw({ type: 'application/json' }), async (req, res, next) => {
@@ -296,10 +396,13 @@ function createApp(options = {}) {
     try {
       await repository.initialize();
       const snapshot = await repository.getSnapshot();
-      const ready = Boolean(snapshot.tenants && snapshot.users);
+      const controlPlaneReady = Boolean(snapshot.tenants && snapshot.users);
+      const dataPlane = await tenantDataRepository.check();
+      const ready = controlPlaneReady && dataPlane.status !== 'unavailable';
       res.status(ready ? 200 : 503).json({
-        status: ready ? 'ready' : 'not_ready',
-        initialized: ready,
+        status: !controlPlaneReady ? 'not_ready' : ready ? 'ready' : 'degraded',
+        initialized: controlPlaneReady,
+        tenantData: dataPlane,
         timestamp: new Date().toISOString(),
       });
     } catch (error) {
@@ -330,6 +433,17 @@ function createApp(options = {}) {
         '/api/v1/databases': {
           get: { summary: 'List accessible databases' },
           post: { summary: 'Create database' },
+        },
+        '/api/v1/projects/{projectId}/databases/{databaseId}/records': {
+          get: { summary: 'List tenant-scoped PostgreSQL records' },
+        },
+        '/api/v1/projects/{projectId}/databases/{databaseId}/records/{recordKey}': {
+          get: { summary: 'Read a tenant-scoped PostgreSQL record' },
+          put: { summary: 'Create or replace a tenant-scoped PostgreSQL record' },
+          delete: { summary: 'Delete a tenant-scoped PostgreSQL record' },
+        },
+        '/api/v1/projects/{projectId}/databases/{databaseId}/query': {
+          post: { summary: 'Execute a restricted, parameterized PostgreSQL statement' },
         },
         '/api/v1/usage': { get: { summary: 'Get a tenant billing-period usage summary and recent usage history' } },
         '/api/v1/billing/checkout': { post: { summary: 'Create a Stripe Checkout subscription session' } },
@@ -675,7 +789,7 @@ function createApp(options = {}) {
     requireUsage(repository, planConfig, usageGracePeriodSeconds, 'write', 'databases', clock),
     async (req, res, next) => {
     try {
-      const { tenantId, name, engine = 'mysql' } = req.body || {};
+      const { tenantId, projectId = null, name, engine = 'mysql' } = req.body || {};
       if (typeof tenantId !== 'string' || typeof name !== 'string' || name.trim().length < 2 || name.trim().length > 128) {
         return errorResponse(res, 400, 'invalid_request', 'tenantId and a 2-128 character name are required.');
       }
@@ -691,12 +805,163 @@ function createApp(options = {}) {
       if (!tenantExists) {
         return errorResponse(res, 404, 'tenant_not_found', 'The specified tenant does not exist.');
       }
+      if (engine === 'postgresql' && typeof projectId !== 'string') {
+        return errorResponse(res, 400, 'invalid_request', 'projectId is required for PostgreSQL tenant databases.');
+      }
+      if (projectId !== null) {
+        const project = await repository.getProjectById(projectId);
+        if (!project || project.tenantId !== tenantId) {
+          return errorResponse(res, 404, 'project_not_found', 'The specified project was not found for this tenant.');
+        }
+      }
 
-      const database = await repository.createDatabase({ tenantId, name: name.trim(), engine, actor: req.user.username });
+      const database = await repository.createDatabase({
+        tenantId,
+        projectId,
+        name: name.trim(),
+        engine,
+        actor: req.user.username,
+      });
       return res.status(201).json({ database });
     } catch (error) {
       return next(error);
     }
+    },
+  );
+
+  const tenantDatabaseContext = requireTenantDatabaseContext(repository, tenantDataRepository);
+  const tenantDataUsage = (operation) => requireUsage(
+    repository,
+    planConfig,
+    usageGracePeriodSeconds,
+    operation,
+    'tenant_data',
+    clock,
+    {
+      resolveTenantIds: (req) => [req.tenantDataContext.tenantId],
+      resolveOperations: (req) => req.tenantDataOperationLimit || 1,
+    },
+  );
+  const recordsPath = '/api/v1/projects/:projectId/databases/:databaseId/records';
+  const validateRecordPagination = (req, res, next) => {
+    const limit = req.query.limit === undefined ? 100 : Number(req.query.limit);
+    const offset = req.query.offset === undefined ? 0 : Number(req.query.offset);
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100
+      || !Number.isSafeInteger(offset) || offset < 0 || offset > 1_000_000) {
+      return errorResponse(res, 400, 'invalid_request', 'limit must be 1-100 and offset must be 0-1000000.');
+    }
+    req.tenantDataPage = { limit, offset };
+    req.tenantDataOperationLimit = limit;
+    return next();
+  };
+
+  app.get(
+    recordsPath,
+    requireAuth(repository),
+    tenantDatabaseContext,
+    validateRecordPagination,
+    tenantDataUsage('read'),
+    async (req, res, next) => {
+    try {
+      const { limit, offset } = req.tenantDataPage;
+      const result = await tenantDataRepository.listRecords(req.tenantDataContext, limit, offset);
+      req.completedUsageOperations = Math.max(1, result.rowCount);
+      return res.json({ records: result.rows });
+    } catch (error) {
+      return next(error);
+    }
+    },
+  );
+
+  app.get(
+    `${recordsPath}/:recordKey`,
+    requireAuth(repository),
+    tenantDatabaseContext,
+    tenantDataUsage('read'),
+    async (req, res, next) => {
+      try {
+        if (!validateRecordKey(req.params.recordKey)) {
+          return errorResponse(res, 400, 'invalid_request', 'recordKey must contain 1-256 characters.');
+        }
+        const result = await tenantDataRepository.getRecord(req.tenantDataContext, req.params.recordKey);
+        if (result.rowCount === 0) {
+          return errorResponse(res, 404, 'record_not_found', 'The requested record was not found.');
+        }
+        return res.json({ record: result.rows[0] });
+      } catch (error) {
+        return next(error);
+      }
+    },
+  );
+
+  app.put(
+    `${recordsPath}/:recordKey`,
+    requireAuth(repository),
+    requireWriteAccess,
+    tenantDatabaseContext,
+    tenantDataUsage('write'),
+    async (req, res, next) => {
+      try {
+        if (!validateRecordKey(req.params.recordKey) || !validateRecordValue(req.body?.value)) {
+          return errorResponse(res, 400, 'invalid_request', 'recordKey and a JSON object or array value are required.');
+        }
+        const result = await tenantDataRepository.putRecord(
+          req.tenantDataContext,
+          req.params.recordKey,
+          req.body.value,
+        );
+        return res.json({ record: result.rows[0] });
+      } catch (error) {
+        return next(error);
+      }
+    },
+  );
+
+  app.delete(
+    `${recordsPath}/:recordKey`,
+    requireAuth(repository),
+    requireWriteAccess,
+    tenantDatabaseContext,
+    tenantDataUsage('write'),
+    async (req, res, next) => {
+      try {
+        if (!validateRecordKey(req.params.recordKey)) {
+          return errorResponse(res, 400, 'invalid_request', 'recordKey must contain 1-256 characters.');
+        }
+        const result = await tenantDataRepository.deleteRecord(req.tenantDataContext, req.params.recordKey);
+        if (result.rowCount === 0) {
+          return errorResponse(res, 404, 'record_not_found', 'The requested record was not found.');
+        }
+        return res.json({ deleted: true, recordKey: req.params.recordKey });
+      } catch (error) {
+        return next(error);
+      }
+    },
+  );
+
+  app.post(
+    '/api/v1/projects/:projectId/databases/:databaseId/query',
+    requireAuth(repository),
+    tenantDatabaseContext,
+    validateTenantSqlRequest,
+    requireTenantSqlScope,
+    tenantDataUsage((req) => req.tenantSql.statementType === 'select' ? 'read' : 'write'),
+    async (req, res, next) => {
+      try {
+        const result = await tenantDataRepository.execute(
+          req.tenantDataContext,
+          req.tenantSql.sql,
+          req.tenantSql.params,
+        );
+        req.completedUsageOperations = Math.max(1, result.rowCount);
+        return res.json({
+          statementType: result.statementType,
+          rowCount: result.rowCount,
+          rows: result.rows,
+        });
+      } catch (error) {
+        return next(error);
+      }
     },
   );
 
@@ -730,6 +995,25 @@ function createApp(options = {}) {
     }
     if (err.type === 'entity.too.large') {
       return errorResponse(res, 413, 'payload_too_large', 'The request body exceeds the 1 MB limit.');
+    }
+    if (err.code === 'invalid_tenant_sql') {
+      return errorResponse(res, 400, 'invalid_sql', err.message);
+    }
+    if (err.code === 'tenant_data_not_configured' || err.tenantDataError) {
+      console.error('Tenant PostgreSQL operation failed.', err);
+      if (err.code === '23505') {
+        return errorResponse(res, 409, 'record_conflict', 'A record with the same key already exists.');
+      }
+      if (err.code?.startsWith('22')) {
+        return errorResponse(res, 400, 'invalid_request', 'The PostgreSQL request contains an invalid value.');
+      }
+      if (err.code === '42501') {
+        return errorResponse(res, 403, 'tenant_scope_violation', 'The PostgreSQL request attempted to access data outside its tenant scope.');
+      }
+      if (err.code?.startsWith('23')) {
+        return errorResponse(res, 400, 'invalid_request', 'The PostgreSQL request violates a data constraint.');
+      }
+      return errorResponse(res, 503, 'tenant_data_unavailable', 'The PostgreSQL tenant data plane is unavailable.');
     }
     console.error(err);
     errorResponse(res, 500, 'internal_error', 'An internal server error occurred.');
