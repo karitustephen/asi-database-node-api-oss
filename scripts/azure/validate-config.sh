@@ -1,12 +1,19 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-: "${AZURE_SUBSCRIPTION_ID:?Set AZURE_SUBSCRIPTION_ID before validation}"
-: "${AZURE_RESOURCE_GROUP:?Set AZURE_RESOURCE_GROUP before validation}"
-: "${AZURE_REGION:?Set AZURE_REGION before validation}"
+if ! command -v az >/dev/null 2>&1; then
+  echo "NOT IMPLEMENTED: Azure validation cannot run because the Azure CLI is unavailable." >&2
+  exit 2
+fi
 
-az account set --subscription "$AZURE_SUBSCRIPTION_ID"
-az group show --name "$AZURE_RESOURCE_GROUP" --query name -o tsv >/dev/null
-az provider show --namespace Microsoft.Compute --query registrationState -o tsv | grep -q "Registered"
+: "${AZURE_SUBSCRIPTION_ID:?Set AZURE_SUBSCRIPTION_ID to validate the target subscription}"
+: "${AZURE_RESOURCE_GROUP:?Set AZURE_RESOURCE_GROUP to validate the target resource group}"
+: "${AZURE_REGION:?Set AZURE_REGION to validate the target region}"
 
-echo "Azure configuration validated for resource group $AZURE_RESOURCE_GROUP in $AZURE_REGION."
+if ! az account show >/dev/null 2>&1; then
+  echo "NOT IMPLEMENTED: Azure authentication is required before a deployment can be validated." >&2
+  exit 2
+fi
+
+echo "NOT IMPLEMENTED: Azure resource validation is intentionally blocked until a tested subscription and deployment plan are available."
+exit 2

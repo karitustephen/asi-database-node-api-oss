@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-: "${APP_NAME:=asi-db-api}"
-
-echo "Running safe application upgrade for $APP_NAME."
+echo "NOT IMPLEMENTED: application upgrade automation is not available until deployment validation and release controls are implemented."
+exit 2

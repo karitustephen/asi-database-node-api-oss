@@ -5,9 +5,9 @@ set -euo pipefail
 : "${CONFIRM_DESTROY:=0}"
 
 if [[ "$CONFIRM_DESTROY" != "1" ]]; then
-  echo "Refusing to destroy Azure resources without CONFIRM_DESTROY=1." >&2
+  echo "NOT IMPLEMENTED: destructive Azure operations are blocked until explicit production approval and validation are in place." >&2
   exit 2
 fi
 
-echo "Destroying Azure resource group $AZURE_RESOURCE_GROUP."
-az group delete --name "$AZURE_RESOURCE_GROUP" --yes --no-wait
+echo "NOT IMPLEMENTED: destroy automation is intentionally disabled for safety and has not been accepted for production use."
+exit 2

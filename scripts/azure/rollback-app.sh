@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-: "${APP_NAME:=asi-db-api}"
-
-echo "Rolling back application deployment for $APP_NAME."
+echo "NOT IMPLEMENTED: rollback automation is intentionally blocked until a tested deployment and artifact registry exist."
+exit 2

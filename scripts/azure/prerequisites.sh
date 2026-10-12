@@ -2,10 +2,13 @@
 set -euo pipefail
 
 if ! command -v az >/dev/null 2>&1; then
-  echo "Azure CLI is required but not installed." >&2
-  exit 1
+  echo "NOT IMPLEMENTED: Azure CLI is required for live Azure validation, but it is not installed in this environment." >&2
+  exit 2
 fi
 
-az account show >/dev/null
+if ! az account show >/dev/null 2>&1; then
+  echo "NOT IMPLEMENTED: Azure CLI is installed but not authenticated. Run 'az login' before attempting Azure deployment." >&2
+  exit 2
+fi
 
-echo "Azure CLI is configured and authenticated."
+echo "Local Azure prerequisite checks passed; live deployment remains unverified in this repository."

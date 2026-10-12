@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-: "${AZURE_RESOURCE_GROUP:?Set AZURE_RESOURCE_GROUP before restore test}"
-
-echo "Restore validation is ready for resource group $AZURE_RESOURCE_GROUP."
+echo "NOT IMPLEMENTED: backup restoration testing is blocked until a durable database and backup process are implemented."
+exit 2

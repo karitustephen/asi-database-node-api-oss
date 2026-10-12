@@ -6,11 +6,12 @@ set -euo pipefail
 : "${APP_NAME:=asi-db-api}"
 
 cat <<EOT
-Planned deployment:
-- Resource group: $AZURE_RESOURCE_GROUP
-- Region: $AZURE_REGION
-- App: $APP_NAME
-- Base image: Ubuntu 22.04 LTS
-- Database Type: MySQL/MariaDB on Azure VM or managed service when approved
-- Security: Key Vault, private networking, RBAC, TLS, and least-privilege identities
+Azure deployment plan (dry run only):
+- Resource group: ${AZURE_RESOURCE_GROUP}
+- Region: ${AZURE_REGION}
+- App name: ${APP_NAME}
+- Runtime: Node.js 18 application container or App Service deployment when verified
+- Database: not yet implemented; MySQL/MariaDB provisioning is blocked until the database design is qualified
+- Security: Key Vault, managed identity, TLS, and private networking are required before production Azure deployment
+- Action: no live Azure mutation is attempted by this script
 EOT
