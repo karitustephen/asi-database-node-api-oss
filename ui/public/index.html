@@ -31,6 +31,19 @@
         border-radius: 8px;
         cursor: pointer;
       }
+      input,
+      select {
+        display: block;
+        width: 100%;
+        box-sizing: border-box;
+        margin: 8px 0 16px;
+        padding: 10px;
+        border: 1px solid #475569;
+        border-radius: 6px;
+      }
+      label {
+        display: block;
+      }
       code {
         font-size: 0.9rem;
         color: #93c5fd;
@@ -41,9 +54,20 @@
     <main>
       <div class="card">
         <h1>ASI Database Console</h1>
-        <p>Production-ready administration console for tenant, project, and database lifecycle workflows.</p>
-        <button id="pingButton">Check API health</button>
-        <pre id="output">Loading…</pre>
+        <p>Tenant usage and database operation quota preview.</p>
+        <form id="loginForm">
+          <label for="username">Username</label>
+          <input id="username" name="username" autocomplete="username" required />
+          <label for="password">Password</label>
+          <input id="password" name="password" type="password" autocomplete="current-password" required />
+          <button type="submit">Sign in</button>
+        </form>
+        <button id="logoutButton" type="button" hidden>Sign out</button>
+        <label for="tenantSelect">Tenant</label>
+        <select id="tenantSelect" disabled></select>
+        <button id="refreshButton" type="button" disabled>Refresh usage</button>
+        <p id="status" role="status" aria-live="polite">Checking API health…</p>
+        <section id="usagePanel" aria-live="polite"></section>
       </div>
     </main>
 

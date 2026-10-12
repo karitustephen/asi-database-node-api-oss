@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-echo "NOT IMPLEMENTED: rollback automation is intentionally blocked until a tested deployment and artifact registry exist."
+echo "Rollback automation is not available until a tested Azure deployment pipeline and artifact registry are in place."
 exit 2

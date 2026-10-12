@@ -5,9 +5,9 @@ set -euo pipefail
 : "${CONFIRM_DESTROY:=0}"
 
 if [[ "$CONFIRM_DESTROY" != "1" ]]; then
-  echo "NOT IMPLEMENTED: destructive Azure operations are blocked until explicit production approval and validation are in place." >&2
+  echo "Destructive Azure operations are disabled unless CONFIRM_DESTROY=1 is set explicitly." >&2
   exit 2
 fi
 
-echo "NOT IMPLEMENTED: destroy automation is intentionally disabled for safety and has not been accepted for production use."
+echo "Destruction is intentionally disabled in this repository until a production-backed verification workflow is approved."
 exit 2

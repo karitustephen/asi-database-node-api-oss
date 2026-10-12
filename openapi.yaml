@@ -4,7 +4,10 @@ info:
   version: 1.0.0
   description: Open-source database backend for the Arybit ecosystem.
 servers:
-  - url: http://localhost:3000
+  - url: https://{host}
+    variables:
+      host:
+        default: localhost:3000
 paths:
   /health:
     get:
@@ -43,5 +46,85 @@ paths:
   /api/v1/databases:
     get:
       summary: List databases
+      description: One operation is metered per tenant included in a successful listing request.
     post:
       summary: Create a database
+      description: One operation is metered for a successful tenant-scoped create request.
+  /api/v1/usage:
+    get:
+      summary: Get tenant usage, notifications, and recent operation history
+      parameters:
+        - name: tenantId
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: period
+          in: query
+          required: false
+          description: Billing period key (YYYY-MM for UTC calendar periods or YYYY-MM-DD for Stripe cycle periods).
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Current or requested tenant billing-period usage.
+        '403':
+          description: The authenticated account cannot access the tenant.
+  /api/v1/billing/checkout:
+    post:
+      summary: Create a Stripe Checkout subscription session
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [tenantId, plan]
+              properties:
+                tenantId:
+                  type: string
+                plan:
+                  type: string
+                  enum: [starter, pro, growth]
+      responses:
+        '201':
+          description: Checkout session created.
+        '409':
+          description: An existing subscription must be managed through the billing portal.
+  /api/v1/billing/portal:
+    post:
+      summary: Create a Stripe Billing Portal session
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [tenantId]
+              properties:
+                tenantId:
+                  type: string
+      responses:
+        '200':
+          description: Billing portal session created.
+  /api/v1/billing/webhook:
+    post:
+      summary: Receive a Stripe subscription event
+      description: Requires the raw Stripe payload and valid Stripe-Signature header. Do not invoke directly from an untrusted client.
+      parameters:
+        - name: Stripe-Signature
+          in: header
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Event was processed or had already been processed.
+        '400':
+          description: Signature invalid or request malformed.
