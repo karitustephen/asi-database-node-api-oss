@@ -63,7 +63,9 @@ jobs:
 
           port="$(docker port "$container_name" 5432/tcp | sed 's/.*://')"
           for attempt in $(seq 1 60); do
-            if docker exec "$container_name" pg_isready -U postgres -d asi_tenant_test >/dev/null 2>&1; then
+            if docker exec -e PGPASSWORD=ci-local-superuser-only "$container_name" \
+              psql -h 127.0.0.1 -U postgres -d asi_tenant_test -v ON_ERROR_STOP=1 -c 'SELECT 1' \
+              >/dev/null 2>&1; then
               break
             fi
             if [ "$attempt" -eq 60 ]; then
