@@ -128,7 +128,7 @@ test('PostgreSQL API operations enforce tenant quotas end to end against SQLite 
     tenantDataRepository,
     usageGracePeriodSeconds: 0,
     planConfig: {
-      starter: { monthlyIncludedOperations: 5 },
+      starter: { monthlyIncludedOperations: 6 },
       pro: { monthlyIncludedOperations: 1_000_000 },
       growth: { monthlyIncludedOperations: 10_000_000 },
     },
@@ -199,15 +199,39 @@ test('PostgreSQL API operations enforce tenant quotas end to end against SQLite 
     assert.equal(sqlResponse.status, 200);
     assert.equal((await sqlResponse.json()).rowCount, 1);
 
+    const failedWriteResponse = await fetch(`${recordsUrl.replace(/\/records$/, '')}/query`, {
+      method: 'POST',
+      headers: authHeaders,
+      body: JSON.stringify({
+        sql: 'UPDATE tenant_data.records SET record_key = $1 WHERE record_key = $2',
+        params: ['x'.repeat(257), recordKey],
+      }),
+    });
+    assert.equal(failedWriteResponse.status, 400);
+    const retryResponse = await fetch(`${recordsUrl.replace(/\/records$/, '')}/query`, {
+      method: 'POST',
+      headers: authHeaders,
+      body: JSON.stringify({
+        sql: 'UPDATE tenant_data.records SET value = $1 WHERE record_key = $2',
+        params: [{ verified: true, retried: true }, recordKey],
+      }),
+    });
+    assert.equal(retryResponse.status, 200);
+    assert.equal((await retryResponse.json()).rowCount, 1);
+    assert.deepEqual(
+      (await tenantDataRepository.getRecord(context, recordKey)).rows[0].value,
+      { verified: true, retried: true },
+    );
+
     const usageResponse = await fetch(`${baseUrl}/api/v1/usage?tenantId=${context.tenantId}`, {
       headers: { authorization: `Bearer ${token}` },
     });
     const usage = await usageResponse.json();
-    assert.equal(usage.usage.usedOperations, 5);
+    assert.equal(usage.usage.usedOperations, 6);
     assert.deepEqual(
       usage.history.filter((event) => event.resource === 'tenant_data')
         .map((event) => event.operations).sort((left, right) => left - right),
-      [1, 1, 1, 1],
+      [1, 1, 1, 1, 1],
     );
 
     const tenantTokenResponse = await fetch(`${baseUrl}/api/v1/auth/login`, {
@@ -264,7 +288,7 @@ test('PostgreSQL API operations enforce tenant quotas end to end against SQLite 
     assert.equal(mismatchedProjectResponse.status, 404);
     assert.deepEqual(
       (await tenantDataRepository.getRecord(context, recordKey)).rows[0].value,
-      { verified: true },
+      { verified: true, retried: true },
     );
   } finally {
     if (server) await new Promise((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
