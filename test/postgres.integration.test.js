@@ -3,6 +3,8 @@
 const assert = require('node:assert/strict');
 const test = require('node:test');
 const { randomUUID } = require('node:crypto');
+const { fork } = require('node:child_process');
+const { once } = require('node:events');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
@@ -368,6 +370,142 @@ test('concurrent PostgreSQL writes across app instances cannot exceed a shared S
       server.close((error) => (error ? reject(error) : resolve()));
     })));
     await Promise.all(apps.map((app) => app.locals.close()));
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('concurrent PostgreSQL writes across Node.js processes cannot exceed a shared SQLite tenant quota', {
+  skip: !connectionString && 'Set ASI_TEST_TENANT_PG_URL to an isolated PostgreSQL test database.',
+}, async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'asi-tenant-data-process-quota-'));
+  const dbPath = path.join(root, 'shared-control.sqlite');
+  const quota = {
+    starter: { monthlyIncludedOperations: 3 },
+    pro: { monthlyIncludedOperations: 10 },
+    growth: { monthlyIncludedOperations: 15 },
+  };
+  const bootstrap = createApp({
+    dbPath,
+    adminUsername: 'postgres-process-admin',
+    adminPassword: 'local-postgres-process-password',
+    tenantAdminUsername: 'postgres-process-user',
+    tenantAdminPassword: 'local-postgres-process-tenant-password',
+    seedDemoData: true,
+    tenantDataRepository: createTenantDataRepository({ connectionString, ssl: false, poolMax: 2 }),
+    usageGracePeriodSeconds: 0,
+    planConfig: quota,
+  });
+  const workers = [];
+  const workerErrors = [];
+  const context = { tenantId: 'tenant-demo', projectId: 'project-demo', databaseId: null };
+  const recordKey = `process-concurrent-${randomUUID()}`;
+  const workerPath = path.join(__dirname, '../scripts/postgres-quota-worker.js');
+  const workerEnv = {
+    ...process.env,
+    ASI_DB_PATH: dbPath,
+    ADMIN_USERNAME: 'postgres-process-admin',
+    ADMIN_PASSWORD: 'local-postgres-process-password',
+    TENANT_ADMIN_USERNAME: 'postgres-process-user',
+    TENANT_ADMIN_PASSWORD: 'local-postgres-process-tenant-password',
+    ASI_SEED_DEMO_DATA: 'true',
+    ASI_TENANT_PG_URL: connectionString,
+    ASI_TENANT_PG_SSL: 'false',
+    ASI_USAGE_GRACE_PERIOD_SECONDS: '0',
+    ASI_PLAN_QUOTAS: JSON.stringify(quota),
+  };
+
+  async function startWorker() {
+    const child = fork(workerPath, [], { env: workerEnv, stdio: ['ignore', 'ignore', 'pipe', 'ipc'] });
+    workers.push(child);
+    let stderr = '';
+    child.stderr.setEncoding('utf8');
+    child.stderr.on('data', (chunk) => { stderr += chunk; });
+    const ready = new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new Error(`Worker startup timed out. ${stderr}`)), 15000);
+      child.once('error', (error) => {
+        clearTimeout(timeout);
+        reject(error);
+      });
+      child.once('exit', (code, signal) => {
+        clearTimeout(timeout);
+        reject(new Error(`Worker exited before startup (code ${code}, signal ${signal}). ${stderr}`));
+      });
+      child.on('message', (message) => {
+        if (message?.type === 'ready') {
+          clearTimeout(timeout);
+          resolve({ child, port: message.port });
+        }
+      });
+    });
+    return ready;
+  }
+
+  try {
+    await bootstrap.locals.initialize();
+    const instances = await Promise.all([startWorker(), startWorker()]);
+    instances.forEach(({ child }) => {
+      child.stderr.on('data', (chunk) => { workerErrors.push(chunk); });
+    });
+    const loginResponse = await fetch(`http://127.0.0.1:${instances[0].port}/api/v1/auth/login`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        username: 'postgres-process-admin',
+        password: 'local-postgres-process-password',
+      }),
+    });
+    assert.equal(loginResponse.status, 200);
+    const token = (await loginResponse.json()).token;
+    const headers = { authorization: `Bearer ${token}`, 'content-type': 'application/json' };
+    const databaseResponse = await fetch(`http://127.0.0.1:${instances[0].port}/api/v1/databases`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        tenantId: context.tenantId,
+        projectId: context.projectId,
+        name: 'postgres-process-quota',
+        engine: 'postgresql',
+      }),
+    });
+    assert.equal(databaseResponse.status, 201);
+    context.databaseId = (await databaseResponse.json()).database.id;
+
+    const responses = await Promise.all(Array.from({ length: 16 }, (_, index) => {
+      const { port } = instances[index % instances.length];
+      return fetch(
+        `http://127.0.0.1:${port}/api/v1/projects/${context.projectId}/databases/${context.databaseId}/records/${recordKey}`,
+        {
+          method: 'PUT',
+          headers,
+          body: JSON.stringify({ value: { request: index } }),
+        },
+      );
+    }));
+    const accepted = responses.filter((response) => response.status === 200).length;
+    const rejected = responses.filter((response) => response.status === 429).length;
+    assert.equal(accepted, 2, `Expected 2 accepted writes and 14 quota rejections; got ${responses.map((r) => r.status)}. ${workerErrors.join('')}`);
+    assert.equal(rejected, 14, `Expected 2 accepted writes and 14 quota rejections; got ${responses.map((r) => r.status)}. ${workerErrors.join('')}`);
+
+    const usageResponse = await fetch(
+      `http://127.0.0.1:${instances[0].port}/api/v1/usage?tenantId=${context.tenantId}`,
+      { headers },
+    );
+    assert.equal(usageResponse.status, 200);
+    const usage = await usageResponse.json();
+    assert.equal(usage.usage.usedOperations, 3);
+    assert.equal(
+      usage.history.filter((event) => event.resource === 'tenant_data')
+        .reduce((total, event) => total + event.operations, 0),
+      2,
+    );
+  } finally {
+    await Promise.all(workers.map(async (child) => {
+      if (child.exitCode !== null || child.signalCode !== null) return;
+      const exited = once(child, 'exit');
+      child.kill('SIGTERM');
+      await exited;
+    }));
+    await bootstrap.locals.close();
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
