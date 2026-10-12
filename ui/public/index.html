@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>ASI Database Console</title>
+    <style>
+      body {
+        margin: 0;
+        font-family: Arial, sans-serif;
+        background: #0f172a;
+        color: #e2e8f0;
+      }
+      main {
+        max-width: 960px;
+        margin: 48px auto;
+        padding: 24px;
+      }
+      .card {
+        background: #111827;
+        border: 1px solid #334155;
+        border-radius: 12px;
+        padding: 24px;
+        box-shadow: 0 8px 24px rgba(15, 23, 42, 0.45);
+      }
+      button {
+        background: #2563eb;
+        color: white;
+        border: none;
+        padding: 10px 16px;
+        border-radius: 8px;
+        cursor: pointer;
+      }
+      code {
+        font-size: 0.9rem;
+        color: #93c5fd;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <div class="card">
+        <h1>ASI Database Console</h1>
+        <p>Production-ready administration console for tenant, project, and database lifecycle workflows.</p>
+        <button id="pingButton">Check API health</button>
+        <pre id="output">Loading…</pre>
+      </div>
+    </main>
+
+    <script src="./app.js"></script>
+  </body>
+</html>
