@@ -12,6 +12,51 @@ const { createApp } = require('../src/app');
 const { createTenantDataRepository } = require('../src/tenant-data');
 
 const connectionString = process.env.ASI_TEST_TENANT_PG_URL;
+const tlsConnectionString = process.env.ASI_TEST_TENANT_PG_TLS_URL;
+const tlsCertificateAuthority = process.env.ASI_TEST_TENANT_PG_TLS_CA;
+const untrustedCertificateAuthority = process.env.ASI_TEST_TENANT_PG_TLS_UNTRUSTED_CA;
+
+test('PostgreSQL TLS verifies trusted CA and hostname and rejects untrusted certificates', {
+  skip: !(tlsConnectionString && tlsCertificateAuthority && untrustedCertificateAuthority)
+    && 'Set ASI_TEST_TENANT_PG_TLS_URL, ASI_TEST_TENANT_PG_TLS_CA, and ASI_TEST_TENANT_PG_TLS_UNTRUSTED_CA for TLS integration tests.',
+}, async () => {
+  const trustedCa = Buffer.from(tlsCertificateAuthority, 'base64');
+  const untrustedCa = Buffer.from(untrustedCertificateAuthority, 'base64');
+  const trustedTls = { ca: trustedCa, rejectUnauthorized: true };
+  const trustedRepository = createTenantDataRepository({
+    connectionString: tlsConnectionString,
+    ssl: trustedTls,
+    poolMax: 1,
+    connectionTimeoutMillis: 3000,
+  });
+  const untrustedRepository = createTenantDataRepository({
+    connectionString: tlsConnectionString,
+    ssl: { ca: untrustedCa, rejectUnauthorized: true },
+    poolMax: 1,
+    connectionTimeoutMillis: 3000,
+  });
+  const mismatchedUrl = new URL(tlsConnectionString);
+  assert.equal(mismatchedUrl.hostname, 'localhost', 'TLS test endpoint must use localhost for hostname verification.');
+  mismatchedUrl.hostname = '127.0.0.1';
+  const mismatchedRepository = createTenantDataRepository({
+    connectionString: mismatchedUrl.toString(),
+    ssl: trustedTls,
+    poolMax: 1,
+    connectionTimeoutMillis: 3000,
+  });
+
+  try {
+    await trustedRepository.initialize();
+    await assert.rejects(untrustedRepository.initialize());
+    await assert.rejects(mismatchedRepository.initialize());
+  } finally {
+    await Promise.all([
+      trustedRepository.close(),
+      untrustedRepository.close(),
+      mismatchedRepository.close(),
+    ]);
+  }
+});
 
 test('PostgreSQL migrations, tenant RLS, CRUD, restricted SQL, and pool recovery work against a local database', {
   skip: !connectionString && 'Set ASI_TEST_TENANT_PG_URL to an isolated PostgreSQL test database.',

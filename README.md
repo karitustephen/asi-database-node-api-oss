@@ -83,6 +83,17 @@ npm run test:postgres
 
 The test requires a dedicated non-superuser test role with schema-creation privileges; it runs migrations and creates then removes only uniquely named test records. Never point it at production data.
 
+The PostgreSQL TLS integration test is enabled when all three TLS variables are set. Its test server certificate must be valid for `localhost`; the untrusted CA must be a different CA certificate. Provide each CA certificate as base64-encoded PEM:
+
+```bash
+export ASI_TEST_TENANT_PG_TLS_URL='postgresql://asi_test:<url-encoded-password>@localhost:<port>/asi_tenant_tls_test'
+export ASI_TEST_TENANT_PG_TLS_CA="$(base64 -w0 trusted-test-ca.pem)"
+export ASI_TEST_TENANT_PG_TLS_UNTRUSTED_CA="$(base64 -w0 unrelated-test-ca.pem)"
+npm run test:postgres
+```
+
+This test verifies successful certificate and hostname validation, and rejection of an untrusted CA and a hostname mismatch. It does not contact a managed PostgreSQL service.
+
 Run tests:
 
 ```bash
