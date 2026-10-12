@@ -658,6 +658,93 @@ function createRepository(dbPath, configuration = {}) {
     };
   }
 
+  async function updateUsageNotifications(tenantId, period, plan, included, used, occurredAt) {
+    for (const threshold of [80, 100]) {
+      if (used * 100 < included * threshold) {
+        continue;
+      }
+      const notification = await getSql(
+        db,
+        'SELECT id FROM usage_notifications WHERE tenant_id = ? AND period = ? AND plan = ? AND threshold = ?',
+        [tenantId, period, plan, threshold],
+      );
+      if (!notification) {
+        await runSql(
+          db,
+          `INSERT INTO usage_notifications
+            (id, tenant_id, period, plan, threshold, usage_percent, state, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, 'dashboard_pending_email_not_configured', ?)`,
+          [randomId('usage-notification'), tenantId, period, plan, threshold, used * 100 / included, occurredAt],
+        );
+      }
+    }
+  }
+
+  async function recoverExpiredUsageReservations(now, gracePeriodSeconds) {
+    const nowIso = now.toISOString();
+    await inTransaction(async () => {
+      const expiredReservations = await allSql(
+        db,
+        `SELECT id, tenant_id, period, operations
+         FROM usage_reservations
+         WHERE expires_at <= ?
+         ORDER BY expires_at, id`,
+        [nowIso],
+      );
+      for (const reservation of expiredReservations) {
+        const operations = Number(reservation.operations);
+        await runSql(
+          db,
+          `UPDATE usage_periods
+           SET reserved_operations = MAX(0, reserved_operations - ?),
+               used_operations = used_operations + ?
+           WHERE tenant_id = ? AND period = ?`,
+          [operations, operations, reservation.tenant_id, reservation.period],
+        );
+        await runSql(
+          db,
+          `INSERT INTO billable_usage_events
+            (id, tenant_id, period, operation, operations, actor, resource, occurred_at)
+           VALUES (?, ?, ?, 'reservation_recovery', ?, 'system', 'reservation_recovery', ?)`,
+          [
+            randomId('usage-event'),
+            reservation.tenant_id,
+            reservation.period,
+            operations,
+            nowIso,
+          ],
+        );
+        await runSql(db, 'DELETE FROM usage_reservations WHERE id = ?', [reservation.id]);
+
+        const usage = await getSql(
+          db,
+          `SELECT plan, included_operations, used_operations, grace_started_at
+           FROM usage_periods WHERE tenant_id = ? AND period = ?`,
+          [reservation.tenant_id, reservation.period],
+        );
+        const included = Number(usage.included_operations);
+        const used = Number(usage.used_operations);
+        await updateUsageNotifications(
+          reservation.tenant_id,
+          reservation.period,
+          usage.plan,
+          included,
+          used,
+          nowIso,
+        );
+        if (used >= included && !usage.grace_started_at) {
+          const graceDeadline = new Date(now.getTime() + gracePeriodSeconds * 1000).toISOString();
+          await runSql(
+            db,
+            `UPDATE usage_periods SET grace_started_at = ?, grace_deadline = ?
+             WHERE tenant_id = ? AND period = ? AND grace_started_at IS NULL`,
+            [nowIso, graceDeadline, reservation.tenant_id, reservation.period],
+          );
+        }
+      }
+    });
+  }
+
   async function reserveUsage({
     tenantIds,
     period,
@@ -679,21 +766,8 @@ function createRepository(dbPath, configuration = {}) {
     const nowIso = now.toISOString();
     const expiresAt = new Date(now.getTime() + 5 * 60 * 1000).toISOString();
 
+    await recoverExpiredUsageReservations(now, gracePeriodSeconds);
     await inTransaction(async () => {
-      const expiredReservations = await allSql(
-        db,
-        'SELECT tenant_id, period, SUM(operations) AS operations FROM usage_reservations WHERE expires_at <= ? GROUP BY tenant_id, period',
-        [nowIso],
-      );
-      for (const expired of expiredReservations) {
-        await runSql(
-          db,
-          'UPDATE usage_periods SET reserved_operations = MAX(0, reserved_operations - ?) WHERE tenant_id = ? AND period = ?',
-          [Number(expired.operations), expired.tenant_id, expired.period],
-        );
-      }
-      await runSql(db, 'DELETE FROM usage_reservations WHERE expires_at <= ?', [nowIso]);
-
       for (const tenantId of tenantIds) {
         const tenant = await getSql(db, 'SELECT id, plan FROM tenants WHERE id = ?', [tenantId]);
         if (!tenant) {
@@ -821,25 +895,7 @@ function createRepository(dbPath, configuration = {}) {
         );
         const included = Number(usage.included_operations);
         const used = Number(usage.used_operations);
-        for (const threshold of [80, 100]) {
-          if (used * 100 < included * threshold) {
-            continue;
-          }
-          const notification = await getSql(
-            db,
-            'SELECT id FROM usage_notifications WHERE tenant_id = ? AND period = ? AND plan = ? AND threshold = ?',
-            [tenantId, period, usage.plan, threshold],
-          );
-          if (!notification) {
-            await runSql(
-              db,
-              `INSERT INTO usage_notifications
-                (id, tenant_id, period, plan, threshold, usage_percent, state, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, 'dashboard_pending_email_not_configured', ?)`,
-              [randomId('usage-notification'), tenantId, period, usage.plan, threshold, used * 100 / included, occurredAt],
-            );
-          }
-        }
+        await updateUsageNotifications(tenantId, period, usage.plan, included, used, occurredAt);
 
         if (used >= included && !usage.grace_started_at) {
           const deadline = new Date(now.getTime() + reservation.gracePeriodSeconds * 1000).toISOString();

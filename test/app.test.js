@@ -1,10 +1,13 @@
 const fs = require('node:fs');
 const path = require('node:path');
+const { fork } = require('node:child_process');
+const { once } = require('node:events');
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const Stripe = require('stripe');
 
 const { createApp } = require('../src/app');
+const { createRepository } = require('../src/storage');
 
 function getTemporaryDbPath(name) {
   const directory = path.resolve(process.cwd(), '.data', 'tests');
@@ -542,6 +545,97 @@ test('concurrent tenant operations cannot exceed an exhausted quota without a gr
     assert.equal(usage.usage.usedOperations, 3);
   } finally {
     await instance.close();
+  }
+});
+
+test('recovery charges an expired reservation after the reserving process is terminated', async () => {
+  const dbPath = getTemporaryDbPath('crashed-usage-reservation');
+  const configuration = {
+    adminUsername: 'crash-test-admin',
+    adminPassword: 'local-crash-test-admin-password',
+    seedDemoData: true,
+  };
+  const repository = createRepository(dbPath, configuration);
+  const worker = fork(path.resolve(__dirname, '../scripts/usage-reservation-crash-worker.js'), [], {
+    env: {
+      ...process.env,
+      ASI_DB_PATH: dbPath,
+      ADMIN_USERNAME: configuration.adminUsername,
+      ADMIN_PASSWORD: configuration.adminPassword,
+    },
+    stdio: ['ignore', 'ignore', 'pipe', 'ipc'],
+  });
+  let stderr = '';
+  worker.stderr.setEncoding('utf8');
+  worker.stderr.on('data', (chunk) => { stderr += chunk; });
+
+  try {
+    await repository.initialize();
+    const reserved = new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new Error(`Worker did not reserve usage. ${stderr}`)), 15000);
+      worker.once('error', (error) => {
+        clearTimeout(timeout);
+        reject(error);
+      });
+      worker.once('exit', (code, signal) => {
+        clearTimeout(timeout);
+        reject(new Error(`Worker exited before reserving usage (code ${code}, signal ${signal}). ${stderr}`));
+      });
+      worker.on('message', (message) => {
+        if (message?.type === 'reserved') {
+          clearTimeout(timeout);
+          resolve(message);
+        }
+      });
+    });
+    const reservation = await reserved;
+    assert.match(reservation.id, /^usage-reservation-/);
+    const exited = once(worker, 'exit');
+    worker.kill('SIGKILL');
+    await exited;
+
+    await assert.rejects(repository.reserveUsage({
+      tenantIds: ['tenant-demo'],
+      period: '2026-10',
+      operation: 'write',
+      actor: 'recovery-test',
+      resource: 'tenant_data',
+      operations: 1,
+      includedOperations: { starter: 1, pro: 10, growth: 15 },
+      gracePeriodSeconds: 0,
+      now: new Date('2026-10-12T17:06:00.000Z'),
+    }), { code: 'usage_limit_exceeded' });
+    await assert.rejects(repository.reserveUsage({
+      tenantIds: ['tenant-demo'],
+      period: '2026-10',
+      operation: 'write',
+      actor: 'recovery-retry',
+      resource: 'tenant_data',
+      operations: 1,
+      includedOperations: { starter: 1, pro: 10, growth: 15 },
+      gracePeriodSeconds: 0,
+      now: new Date('2026-10-12T17:07:00.000Z'),
+    }), { code: 'usage_limit_exceeded' });
+
+    const usage = await repository.getUsageSummary(
+      'tenant-demo',
+      '2026-10',
+      { starter: 1, pro: 10, growth: 15 },
+    );
+    assert.equal(usage.usedOperations, 1);
+    assert.equal(usage.remainingOperations, 0);
+    const history = await repository.getUsageHistory('tenant-demo', 10);
+    assert.equal(history.length, 1);
+    assert.equal(history[0].operations, 1);
+    assert.equal(history[0].period, '2026-10');
+    assert.equal(history[0].resource, 'reservation_recovery');
+  } finally {
+    if (worker.exitCode === null && worker.signalCode === null) {
+      const exited = once(worker, 'exit');
+      worker.kill('SIGKILL');
+      await exited;
+    }
+    await repository.close();
   }
 });
 
